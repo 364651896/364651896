@@ -13,7 +13,7 @@ dynamic_timeout() {
 # [优化] 核心IP段预筛选
 CF_IP_PREFER_RANGES=("104.16" "104.24" "172.64" "108.162")
 
-fifunction bettercloudflareip(){
+function bettercloudflareip(){
     # [修正] 缓存检查逻辑
     if [ -f "cf_bestip.cache" ]; then
         cached_ip=$(awk '{print $1}' cf_bestip.cache)
