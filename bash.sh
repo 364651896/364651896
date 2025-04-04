@@ -1,111 +1,450 @@
 #!/bin/bash
-# Cloudflare IP优选脚本增强版 v3.2 (2025-04-04)
-# 功能：多协议支持 | 智能评分 | 动态超时 | 结果缓存
+# better-cloudflare-ip (Optimized v3.2)
 
-# 初始化配置
-COLOR_RED="\033[31m"
-COLOR_GREEN="\033[32m"
-COLOR_YELLOW="\033[33m"
-COLOR_RESET="\033[0m"
-WORKDIR="$HOME/cf_ip_test"
-CACHE_FILE="$WORKDIR/best_ip.cache"
-
-# [新增] 智能评分算法 [6,8](@ref)
-function calculate_score() {
-    local latency=$1 speed=$2 stability=$3
-    echo "scale=2; ($speed/1048576*60) + (1000/($latency+1)*30) + ((1-$stability)*10)" | bc -l
+# [新增] 动态超时函数
+dynamic_timeout() {
+    base_rtt=$(ping -c 2 1.1.1.1 2>/dev/null | awk -F'/' 'END{print $5}')
+    timeout=$(( ${base_rtt:-200} / 100 + 2 ))
+    [[ $timeout -lt 3 ]] && timeout=3
+    [[ $timeout -gt 10 ]] && timeout=10
+    echo $timeout
 }
 
-# [重构] 增强版测速函数
-function enhanced_speedtest() {
-    local ip=$1 proto=$2
-    local results=() success=0 total_latency=0 max_speed=0
+# [优化] 核心IP段预筛选
+CF_IP_PREFER_RANGES=("104.16" "104.24" "172.64" "108.162")
 
-    # 动态超时调整 [6](@ref)
-    local base_rtt=$(ping -c 2 1.1.1.1 | awk -F'/' 'END{print $5}')
-    local TIMEOUT=$(( ${base_rtt%.*} / 100 + 2 ))
-    [[ $TIMEOUT -lt 3 ]] && TIMEOUT=3
-    [[ $TIMEOUT -gt 10 ]] && TIMEOUT=10
-
-    for i in {1..3}; do
-        local start=$(date +%s%N)
-        if [ $proto -eq 1 ]; then
-            local speed=$(curl --resolve $domain:443:$ip https://$domain/$file -o /dev/null \
-                --connect-timeout $TIMEOUT -w "%{speed_download}\n%{http_code}" 2>/dev/null)
-        else
-            local speed=$(curl -x $ip:80 http://$domain/$file -o /dev/null \
-                --connect-timeout $TIMEOUT -w "%{speed_download}\n%{http_code}" 2>/dev/null)
-        fi
-        
-        if [[ $(echo "$speed" | tail -n1) == "200" ]]; then
-            success=$((success+1))
-            local speed_val=$(echo "$speed" | head -n1 | awk '{printf "%.0f", $1}')
-            local latency=$(( ($(date +%s%N) - start)/1000000 ))
-            total_latency=$((total_latency + latency))
-            [ $speed_val -gt $max_speed ] && max_speed=$speed_val
-        fi
-        sleep 0.3 # 防止请求风暴 [6](@ref)
-    done
-
-    if [ $success -gt 0 ]; then
-        local avg_latency=$(( total_latency / success ))
-        local loss_rate=$(echo "scale=2; 1 - $success/3" | bc)
-        local score=$(calculate_score $avg_latency $max_speed $loss_rate)
-        printf "%-15s %.2f %d %d %.2f\n" "$ip" $score $avg_latency $((max_speed/1024)) $loss_rate
-        return 0
-    fi
-    return 1
-}
-
-# [优化] 主测速流程
-function cloudflaretest(){
-    # 缓存检查 [6](@ref)
-    if [ -f "$CACHE_FILE" ]; then
-        local cached_ip=$(awk '{print $1}' $CACHE_FILE)
-        local test_result=$(curl --resolve $domain:443:$cached_ip -m 2 -Is https://$domain | head -1)
-        [[ "$test_result" == *"200"* ]] && {
+function bettercloudflareip(){
+    # [新增] 缓存检查
+    if [ -f "cf_bestip.cache" ]; then
+        cached_ip=$(awk '{print $1}' cf_bestip.cache)
+        if curl --resolve $domain:443:$cached_ip -m 2 -Is https://$domain | grep -q "200"; then
             echo "使用缓存IP: $cached_ip"
-            return 0
-        }
-    }
+            anycast=$cached_ip
+            return
+        fi
+    fi
 
-    # IP预筛选（Cloudflare核心ASN）[6](@ref)
-    grep -E '104\.16|104\.24|172\.64' ips-v4.txt > $WORKDIR/premium-ips.txt
-    shuf $WORKDIR/premium-ips.txt | head -500 > $WORKDIR/testlist.txt
-
-    # 多线程测速
-    export -f enhanced_speedtest calculate_score
-    cat $WORKDIR/testlist.txt | xargs -P $THREADS -I {} bash -c 'enhanced_speedtest {} 1' > $WORKDIR/results.txt
-
-    # 结果处理
-    sort -nrk2 $WORKDIR/results.txt | head -10 > $WORKDIR/top10.txt
-    local best_ip=$(awk 'NR==1{print $1}' $WORKDIR/top10.txt)
-    local best_score=$(awk 'NR==1{print $2}' $WORKDIR/top10.txt)
-    
-    # 缓存最佳结果 [6](@ref)
-    echo "$best_ip $best_score $(date +%s)" > $CACHE_FILE
-}
-
-# [保留] 数据检查与菜单系统
-function datacheck(){
-    # ... (原有数据下载逻辑不变)
-}
-
-# [优化] 主函数流程
-main() {
-    check_dependencies
-    dynamic_timeout
-    generate_ip_pool
+    read -p "请设置期望的带宽大小(默认最小1,单位 Mbps):" bandwidth
+    read -p "请设置RTT测试进程数(默认10,最大50):" tasknum
+    if [ -z "$bandwidth" ]; then
+        bandwidth=1
+    fi
+    if [ $bandwidth -eq 0 ]; then
+        bandwidth=1
+    fi
+    if [ -z "$tasknum" ]; then
+        tasknum=10
+    fi
+    if [ $tasknum -eq 0 ]; then
+        echo "进程数不能为0,自动设置为默认值"
+        tasknum=10
+    fi
+    if [ $tasknum -gt 50 ]; then
+        echo "超过最大进程限制,自动设置为最大值"
+        tasknum=50
+    fi
+    speed=$[$bandwidth*128*1024]
+    starttime=$(date +%s)
     cloudflaretest
-    show_result
+    realbandwidth=$[$max/128]
+    endtime=$(date +%s)
+    echo "从服务器获取详细信息"
+    unset temp
+    if [ "$ips" == "ipv4" ]; then
+        if [ $tls == 1 ]; then
+            temp=($(curl --resolve $domain:443:$anycast --retry 1 -s https://$domain/cdn-cgi/trace --connect-timeout 2 --max-time 3))
+        else
+            temp=($(curl -x $anycast:80 --retry 1 -s http://$domain/cdn-cgi/trace --connect-timeout 2 --max-time 3))
+        fi
+    else
+        if [ $tls == 1 ]; then
+            temp=($(curl --resolve $domain:443:$anycast --retry 1 -s https://$domain/cdn-cgi/trace --connect-timeout 2 --max-time 3))
+        else
+            temp=($(curl -x [$anycast]:80 --retry 1 -s http://$domain/cdn-cgi/trace --connect-timeout 2 --max-time 3))
+        fi
+    fi
+    if [ $(echo ${temp[@]} | sed -e 's/ /\n/g' | grep colo= | wc -l) == 0 ]; then
+        publicip=获取超时
+        colo=获取超时
+    else
+        publicip=$(echo ${temp[@]} | sed -e 's/ /\n/g' | grep ip= | cut -f 2- -d'=')
+        colo=$(grep -w "($(echo ${temp[@]} | sed -e 's/ /\n/g' | grep colo= | cut -f 2- -d'='))" colo.txt | awk -F"-" '{print $1}')
+    fi
+    clear
+    echo "优选IP $anycast"
+    echo "公网IP $publicip"
+    if [ $tls == 1 ]; then
+        echo "支持端口 443 2053 2083 2087 2096 8443"
+    else
+        echo "支持端口 80 8080 8880 2052 2082 2086 2095"
+    fi
+    echo "设置带宽 $bandwidth Mbps"
+    echo "实测带宽 $realbandwidth Mbps"
+    echo "峰值速度 $max kB/s"
+    echo "往返延迟 $avgms 毫秒"
+    echo "数据中心 $colo"
+    echo "总计用时 $[$endtime-$starttime] 秒"
+    
+    # [新增] 写入缓存
+    echo "$anycast $(date +%s)" > cf_bestip.cache
 }
 
-# [新增] 结果显示函数
-function show_result() {
-    echo -e "\n${COLOR_GREEN}========== 优选TOP 10 IP（综合评分） ==========${COLOR_RESET}"
-    awk '{printf "%-15s 评分:%-8.2f 延迟:%-4dms 带宽:%-3dMB/s 丢包率:%-5.2f%%\n", $1,$2,$3,$4,$5*100}' final.txt | head -10
-    echo -e "${COLOR_GREEN}===============================================${COLOR_RESET}"
+function rtthttps(){
+    avgms=0
+    n=1
+    for ip in `cat rtt/$1.txt`; do
+        while true; do
+            if [ $n -le 3 ]; then
+                rsp=$(curl --resolve $domain:443:$ip https://$domain/cdn-cgi/trace -o /dev/null -s --connect-timeout $(dynamic_timeout) --max-time 3 -w %{time_connect}_%{http_code})
+                if [ $(echo $rsp | awk -F_ '{print $2}') != 200 ]; then
+                    avgms=0
+                    n=1
+                    break
+                else
+                    avgms=$[$(echo $rsp | awk -F_ '{printf ("%d\n",$1*1000000)}')+$avgms]
+                    n=$[$n+1]
+                fi
+            else
+                avgms=$[$avgms/3000]
+                if [ $avgms -lt 10 ]; then
+                    echo 00$avgms $ip >> rtt/$1.log
+                elif [ $avgms -ge 10 ] && [ $avgms -lt 100 ]; then
+                    echo 0$avgms $ip >> rtt/$1.log
+                else
+                    echo $avgms $ip >> rtt/$1.log
+                fi
+                avgms=0
+                n=1
+                break
+            fi
+        done
+    done
+    rm -rf rtt/$1.txt
 }
 
-# 执行入口
-main "$@"
+function rtthttp(){
+    avgms=0
+    n=1
+    for ip in `cat rtt/$1.txt`; do
+        while true; do
+            if [ $n -le 3 ]; then
+                if [ $(echo $ip | grep : | wc -l) == 0 ]; then
+                    rsp=$(curl -x $ip:80 http://$domain/cdn-cgi/trace -o /dev/null -s --connect-timeout $(dynamic_timeout) --max-time 3 -w %{time_connect}_%{http_code})
+                else
+                    rsp=$(curl -x [$ip]:80 http://$domain/cdn-cgi/trace -o /dev/null -s --connect-timeout $(dynamic_timeout) --max-time 3 -w %{time_connect}_%{http_code})
+                fi
+                if [ $(echo $rsp | awk -F_ '{print $2}') != 200 ]; then
+                    avgms=0
+                    n=1
+                    break
+                else
+                    avgms=$[$(echo $rsp | awk -F_ '{printf ("%d\n",$1*1000000)}')+$avgms]
+                    n=$[$n+1]
+                fi
+            else
+                avgms=$[$avgms/3000]
+                if [ $avgms -lt 10 ]; then
+                    echo 00$avgms $ip >> rtt/$1.log
+                elif [ $avgms -ge 10 ] && [ $avgms -lt 100 ]; then
+                    echo 0$avgms $ip >> rtt/$1.log
+                else
+                    echo $avgms $ip >> rtt/$1.log
+                fi
+                avgms=0
+                n=1
+                break
+            fi
+        done
+    done
+    rm -rf rtt/$1.txt
+}
+
+# [优化] 三次测速取最优
+function speedtesthttps(){
+    local max=0
+    for i in {1..3}; do
+        rm -rf log.txt speed.txt
+        curl --resolve $domain:443:$1 https://$domain/$file -o /dev/null --connect-timeout $(dynamic_timeout) --max-time 10 > log.txt 2>&1
+        cat log.txt | tr '\r' '\n' | awk '{print $NF}' | sed '1,3d;$d' | grep -v 'k\|M' >> speed.txt
+        for i in `cat log.txt | tr '\r' '\n' | awk '{print $NF}' | sed '1,3d;$d' | grep k | sed 's/k//g'`; do
+            k=$[$i*1024]
+            echo $k >> speed.txt
+        done
+        for i in `cat log.txt | tr '\r' '\n' | awk '{print $NF}' | sed '1,3d;$d' | grep M | sed 's/M//g'`; do
+            M=$[$(echo | awk '{print '$i'*10 }')*1024*1024/10]
+            echo $M >> speed.txt
+        done
+        current_max=$(cat speed.txt | sort -nr | head -1)
+        [[ $current_max -gt $max ]] && max=$current_max
+        sleep 0.5
+    done
+    rm -rf log.txt speed.txt
+    echo $max
+}
+
+function speedtesthttp(){
+    local max=0
+    for i in {1..3}; do
+        rm -rf log.txt speed.txt
+        if [ $(echo $1 | grep : | wc -l) == 0 ]; then
+            curl -x $1:80 http://$domain/$file -o /dev/null --connect-timeout $(dynamic_timeout) --max-time 10 > log.txt 2>&1
+        else
+            curl -x [$1]:80 http://$domain/$file -o /dev/null --connect-timeout $(dynamic_timeout) --max-time 10 > log.txt 2>&1
+        fi
+        cat log.txt | tr '\r' '\n' | awk '{print $NF}' | sed '1,3d;$d' | grep -v 'k\|M' >> speed.txt
+        for i in `cat log.txt | tr '\r' '\n' | awk '{print $NF}' | sed '1,3d;$d' | grep k | sed 's/k//g'`; do
+            k=$[$i*1024]
+            echo $k >> speed.txt
+        done
+        for i in `cat log.txt | tr '\r' '\n' | awk '{print $NF}' | sed '1,3d;$d' | grep M | sed 's/M//g'`; do
+            M=$[$(echo | awk '{print '$i'*10 }')*1024*1024/10]
+            echo $M >> speed.txt
+        done
+        current_max=$(cat speed.txt | sort -nr | head -1)
+        [[ $current_max -gt $max ]] && max=$current_max
+        sleep 0.5
+    done
+    rm -rf log.txt speed.txt
+    echo $max
+}
+
+function cloudflaretest(){
+    while true; do
+        while true; do
+            rm -rf rtt rtt.txt log.txt speed.txt
+            mkdir rtt
+            echo "正在生成 $ips"
+            unset temp
+            if [ "$ips" == "ipv4" ]; then
+                # [优化] 优先使用推荐IP段
+                shuf $filename | grep -E "$(IFS="|"; echo "${CF_IP_PREFER_RANGES[*]}")" | head -100 > rtt/ip_candidates.txt
+                n=0
+                while read ip; do
+                    temp[$n]=$ip
+                    n=$[$n+1]
+                done < rtt/ip_candidates.txt
+                
+                # 补充随机IP直到达到数量要求
+                while [ $n -lt 100 ]; do
+                    temp[$n]=$(echo $[RANDOM%256].$[RANDOM%256].$[RANDOM%256].$[RANDOM%256])
+                    n=$[$n+1]
+                done
+            else
+                n=0
+                iplist=100
+                while true; do
+                    for i in `awk 'BEGIN{srand()} {print rand()"\t"$0}' $filename | sort -n | awk '{print $2} NR=='$iplist' {exit}' | awk -F: '{print $1":"$2":"$3}'`; do
+                        temp[$n]=$(echo $i:$(printf '%x\n' $(($RANDOM*2+$RANDOM%2))):$(printf '%x\n' $(($RANDOM*2+$RANDOM%2))):$(printf '%x\n' $(($RANDOM*2+$RANDOM%2))):$(printf '%x\n' $(($RANDOM*2+$RANDOM%2))):$(printf '%x\n' $(($RANDOM*2+$RANDOM%2))))
+                        n=$[$n+1]
+                    done
+                    [ $n -ge $iplist ] && break
+                done
+            fi
+            
+            ipnum=$(echo ${temp[@]} | sed -e 's/ /\n/g' | sort -u | wc -l)
+            if [ $tasknum == 0 ]; then
+                tasknum=1
+            fi
+            if [ $ipnum -lt $tasknum ]; then
+                tasknum=$ipnum
+            fi
+            n=1
+            for i in `echo ${temp[@]} | sed -e 's/ /\n/g' | sort -u`; do
+                echo $i>>rtt/$n.txt
+                if [ $n == $tasknum ]; then
+                    n=1
+                else
+                    n=$[$n+1]
+                fi
+            done
+            n=1
+            while true; do
+                if [ $tls == 1 ]; then
+                    rtthttps $n &
+                else
+                    rtthttp $n &
+                fi
+                if [ $n == $tasknum ]; then
+                    break
+                else
+                    n=$[$n+1]
+                fi
+            done
+            while true; do
+                n=$(ls rtt | grep txt | wc -l)
+                if [ $n -ne 0 ]; then
+                    echo "$(date +'%H:%M:%S') 等待RTT测试结束,剩余进程数 $n"
+                else
+                    echo "$(date +'%H:%M:%S') RTT测试完成"
+                    break
+                fi
+                sleep 1
+            done
+            n=$(ls rtt | grep log | wc -l)
+            if [ $n == 0 ]; then
+                echo "当前所有IP都存在RTT丢包"
+                echo "继续新的RTT测试"
+            else
+                cat rtt/*.log > rtt.txt
+                status=0
+                echo "待测速的IP地址"
+                cat rtt.txt | sort | awk '{print $2" 往返延迟 "$1" 毫秒"}'
+                for i in `cat rtt.txt | sort | awk '{print $1"_"$2}'`; do
+                    avgms=$(echo $i | awk -F_ '{print $1}')
+                    ip=$(echo $i | awk -F_ '{print $2}')
+                    echo "正在测试 $ip"
+                    if [ $tls == 1 ]; then
+                        max=$(speedtesthttps $ip)
+                    else
+                        max=$(speedtesthttp $ip)
+                    fi
+                    if [ $max -ge $speed ]; then
+                        status=1
+                        anycast=$ip
+                        max=$[$max/1024]
+                        echo "$ip 峰值速度 $max kB/s"
+                        rm -rf rtt rtt.txt
+                        break
+                    else
+                        max=$[$max/1024]
+                        echo "$ip 峰值速度 $max kB/s"
+                    fi
+                done
+                if [ $status == 1 ]; then
+                    break
+                fi
+            fi
+        done
+        break
+    done
+}
+
+function singlehttps(){
+    read -p "请输入需要测速的IP: " ip
+    read -p "请输入需要测速的端口(默认443): " port
+    if [ -z "$ip" ]; then
+        echo "未输入IP"
+    fi
+    if [ -z "$port" ]; then
+        port=443
+    fi
+    echo "正在测速 $ip 端口 $port"
+    speed_download=$(curl --resolve $domain:$port:$ip https://$domain:$port/$file -o /dev/null --connect-timeout $(dynamic_timeout) --max-time 15 -w %{speed_download} | awk -F\. '{printf ("%d\n",$1/1024)}')
+}
+
+function singlehttp(){
+    read -p "请输入需要测速的IP: " ip
+    read -p "请输入需要测速的端口(默认80): " port
+    if [ -z "$ip" ]; then
+        echo "未输入IP"
+    fi
+    if [ -z "$port" ]; then
+        port=80
+    fi
+    echo "正在测速 $ip 端口 $port"
+    if [ $(echo $ip | grep : | wc -l) == 0 ]; then
+        speed_download=$(curl -x $ip:$port http://$domain:$port/$file -o /dev/null --connect-timeout $(dynamic_timeout) --max-time 15 -w %{speed_download} | awk -F\. '{printf ("%d\n",$1/1024)}')
+    else
+        speed_download=$(curl -x [$ip]:$port http://$domain:$port/$file -o /dev/null --connect-timeout $(dynamic_timeout) --max-time 15 -w %{speed_download} | awk -F\. '{printf ("%d\n",$1/1024)}')
+    fi
+}
+
+function datacheck(){
+    clear
+    echo "如果这些下面这些文件下载失败,可以手动访问网址下载保存至同级目录"
+    echo "https://www.baipiao.eu.org/cloudflare/colo 另存为 colo.txt"
+    echo "https://www.baipiao.eu.org/cloudflare/url 另存为 url.txt"
+    echo "https://www.baipiao.eu.org/cloudflare/ips-v4 另存为 ips-v4.txt"
+    echo "https://www.baipiao.eu.org/cloudflare/ips-v6 另存为 ips-v6.txt"
+    while true; do
+        if [ ! -f "colo.txt" ]; then
+            echo "从服务器下载数据中心信息 colo.txt"
+            curl --retry 2 -s https://www.baipiao.eu.org/cloudflare/colo -o colo.txt
+        elif [ ! -f "url.txt" ]; then
+            echo "从服务器下载测速文件地址 url.txt"
+            curl --retry 2 -s https://www.baipiao.eu.org/cloudflare/url -o url.txt
+        elif [ ! -f "ips-v4.txt" ]; then
+            echo "从服务器下载IPV4数据 ips-v4.txt"
+            curl --retry 2 -s https://www.baipiao.eu.org/cloudflare/ips-v4 -o ips-v4.txt
+        elif [ ! -f "ips-v6.txt" ]; then
+            echo "从服务器下载IPV6数据 ips-v6.txt"
+            curl --retry 2 -s https://www.baipiao.eu.org/cloudflare/ips-v6 -o ips-v6.txt
+        else
+            break
+        fi
+    done
+}
+
+datacheck
+url=$(sed -n '1p' url.txt)
+domain=$(echo $url | cut -f 1 -d'/')
+file=$(echo $url | cut -f 2- -d'/')
+clear
+while true; do
+    echo "1. IPV4优选(TLS)"
+    echo "2. IPV4优选"
+    echo "3. IPV6优选(TLS)"
+    echo "4. IPV6优选"
+    echo "5. 单IP测速(TLS)"
+    echo "6. 单IP测速"
+    echo "7. 清空缓存"
+    echo "8. 更新数据"
+    echo -e "0. 退出\n"
+    read -p "请选择菜单(默认0): " menu
+    if [ -z "$menu" ]; then
+        menu=0
+    fi
+    if [ $menu == 0 ]; then
+        clear
+        echo "退出成功"
+        break
+    fi
+    if [ $menu == 1 ]; then
+        ips=ipv4
+        filename=ips-v4.txt
+        tls=1
+        bettercloudflareip
+        break
+    fi
+    if [ $menu == 2 ]; then
+        ips=ipv4
+        filename=ips-v4.txt
+        tls=0
+        bettercloudflareip
+        break
+    fi
+    if [ $menu == 3 ]; then
+        ips=ipv6
+        filename=ips-v6.txt
+        tls=1
+        bettercloudflareip
+        break
+    fi
+    if [ $menu == 4 ]; then
+        ips=ipv6
+        filename=ips-v6.txt
+        tls=0
+        bettercloudflareip
+        break
+    fi
+    if [ $menu == 5 ]; then
+        singlehttps
+        clear
+        echo "$ip 平均速度 $speed_download kB/s"
+    fi
+    if [ $menu == 6 ]; then
+        singlehttp
+        clear
+        echo "$ip 平均速度 $speed_download kB/s"
+    fi
+    if [ $menu == 7 ]; then
+        rm -rf rtt rtt.txt log.txt speed.txt cf_bestip.cache
+        clear
+        echo "缓存已经清空"
+    fi
+    if [ $menu == 8 ]; then
+        rm -rf colo.txt url.txt ips-v4.txt ips-v6.txt
+        datacheck
+        clear
+    fi
+done
