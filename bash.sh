@@ -1,104 +1,89 @@
 #!/bin/bash
-# Cloudflare智能优选脚本 - 2025.08专业版
+# Optimized Cloudflare IP Selector v2.1
 
-# 配置区
-MAX_IPS=300                # 最大候选IP数量
-THREADS=50                 # 并发线程数（支持到100）
-BANDWIDTH=20               # 带宽阈值(Mbps) 
-TEST_FILE="https://cf.xiu2.xyz/urlspeed.txt"  # 智能测速文件
-DATA_SOURCES=(             # 多源IP库
-  "https://cf.vbar.fun/ip.txt"
-  "https://zip.baipiao.eu.org/cloudflare/ips-v4"
+# 配置区（可根据需要调整）
+CF_IPS_URL="https://www.cloudflare.com/ips-v4"
+BANDWIDTH=10                  # 默认带宽要求(Mbps)
+THREADS=20                    # 测试线程数
+TEST_DURATION=5              # 单IP测试时长(秒)
+PACKET_LOSS_THRESHOLD=15     # 丢包率阈值(百分比)
+
+# 运营商优选CIDR（根据网页3/11优化）
+declare -A ISP_CIDR=(
+  ["移动"]="104.16.96.0/20 104.18.48.0/20 172.64.32.0/24"
+  ["电信"]="104.16.160.0/24 172.64.0.0/24 104.21.11.0/24" 
+  ["联通"]="104.23.240.0/20 104.27.128.0/20 172.68.0.0/16"
 )
-COLOMAP_URL="https://cf.xiu2.xyz/colo.txt"     # 数据中心映射表
 
-# 环境初始化
-init_env() {
-  ! command -v jq &>/dev/null && pkg install -y jq
-  ! command -v parallel &>/dev/null && pkg install -y parallel
-  [ ! -f colo.txt ] && curl -sL $COLOMAP_URL -o colo.txt
+# 多维度评分权重（参考网页6）
+LATENCY_WEIGHT=0.3
+SPEED_WEIGHT=0.4
+STABILITY_WEIGHT=0.2
+PACKET_LOSS_WEIGHT=0.1
+
+# 初始化环境
+function init_env() {
+  mkdir -p tmp
+  rm -rf tmp/*
+  echo "正在更新IP库..."
+  curl -s $CF_IPS_URL -o tmp/cf_ips.txt
+  [[ $ISP ]] && filter_isp_cidr
 }
 
-# 动态IP池更新
-update_ip_pool() {
-  echo "? 同步全球CF节点库..."
-  rm -f ip_all.txt ip_filtered.txt
-  parallel -j 10 "curl -sL {} | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?'" ::: ${DATA_SOURCES[@]} >> ip_all.txt
-  
-  # 智能去重+随机采样
-  sort -u ip_all.txt | awk '
-    BEGIN { srand() }
-    { printf "%06d %s\n", int(rand()*1000000), $0 }
-  ' | sort -n | cut -d' ' -f2 | head -n $MAX_IPS > ip_filtered.txt
+# 运营商CIDR过滤（网页3/11方案）
+function filter_isp_cidr() {
+  grep -E "$(echo ${ISP_CIDR[$ISP]} | tr ' ' '|')" tmp/cf_ips.txt > tmp/filtered_ips.txt
+  mv tmp/filtered_ips.txt tmp/cf_ips.txt
 }
 
-# 网络类型识别
-detect_isp() {
-  local org_info=$(curl -sL --max-time 2 http://ipinfo.io/org 2>/dev/null)
-  case "$org_info" in
-    *"Mobile"*)  echo "移动" ;;
-    *"Telecom"*) echo "电信" ;;
-    *"Unicom"*)  echo "联通" ;;
-    *)            echo "其他" ;;
-  esac
+# 增强版网络测试（网页6/13方案）
+function enhanced_test() {
+  local ip=$1
+  local latency=0 packet_loss=0 speed=0
+  
+  # 延迟测试（3次采样）
+  for i in {1..3}; do
+    resp=$(curl -sI --connect-timeout 2 -m 3 -w "%{time_connect}\n%{http_code}" "https://$ip" -o /dev/null)
+    latency=$(bc <<< "$latency + $(awk 'NR==1{print $1*1000}' <<< "$resp")")
+    [[ $(awk 'NR==2{print $1}' <<< "$resp") != 200 ]] && ((packet_loss++))
+  done
+  
+  # 带宽测试（参考网页6）
+  speed=$(curl -o /dev/null -x $ip:443 -w "%{speed_download}" "https://speed.cloudflare.com/__down?bytes=10000000" --connect-timeout 5 -m $TEST_DURATION | \
+    awk '{printf "%.2f", $1/125000}') # 转换为Mbps
+  
+  # 综合评分（网页6算法）
+  local score=$(bc <<< "scale=2; \
+    ($latency/3)*$LATENCY_WEIGHT + \
+    $speed*$SPEED_WEIGHT - \
+    $packet_loss*10*$PACKET_LOSS_WEIGHT + \
+    (100 - ${packet_loss}00/3)*$STABILITY_WEIGHT")
+  
+  echo "$score $ip $latency $packet_loss $speed"
 }
 
-# 分阶段测速算法
-smart_speedtest() {
-  local speed_threshold=$((BANDWIDTH * 128 * 1024))  # Mbps转Bytes/s
+# 主测试流程
+function main_test() {
+  echo "正在生成测试队列..."
+  shuf tmp/cf_ips.txt | head -n 500 > tmp/test_queue.txt
   
-  # 阶段1：快速RTT筛查
-  echo "? 一阶段RTT快速筛查..."
-  cat ip_filtered.txt | parallel -j $THREADS "
-    ip={}
-    rtt=\$(ping -c 2 -W 1 \$ip 2>&1 | awk -F'/' '/rtt/ {print int(\$5)}')
-    [ -z \"\$rtt\" ] && rtt=999
-    loss=\$(ping -c 2 -W 1 \$ip | awk -F'%' '/loss/ {print \$1}' | tr -d ' ')
-    echo \"\$ip,\$rtt,\$loss\"
-  " > rtt.csv
+  echo "启动多线程测试..."
+  export -f enhanced_test
+  parallel -j $THREADS --bar enhanced_test :::: tmp/test_queue.txt > tmp/raw_results.txt
+
+  # 结果排序
+  sort -nr tmp/raw_results.txt | awk '!seen[$2]++' | head -n 50 > tmp/final_results.txt
   
-  # 筛选低延迟IP（RTT<150ms & 丢包<20%）
-  awk -F',' '$2 < 150 && $3 < 20' rtt.csv | sort -t, -k2n > qualified.csv
-  
-  # 阶段2：精确带宽测试
-  echo "? 二阶段带宽精确测试..."
-  cat qualified.csv | parallel --bar -j $THREADS "
-    ip=\$(echo {} | cut -d',' -f1)
-    colo=\$(curl -m 3 -s --resolve speedtest.net:443:\$ip https://speedtest.net/cdn-cgi/trace | 
-      awk -F'=' '/colo=/ {print \$2}' | tr -d '\n')
-    speed=\$(curl -m 10 --resolve speedtest.net:443:\$ip "https://speedtest.net/download?size=300000000" -o /dev/null -w '%{speed_download}' 2>/dev/null)
-    speed=\${speed%.*}
-    [ -z \"\$speed\" ] && speed=0
-    echo \"\$ip,\$speed,\$colo\"
-  " > speed.csv
-  
-  # 关联数据并生成结果
-  join -t, qualified.csv speed.csv | awk -F',' '
-    BEGIN { OFS=","; print "IP,RTT(ms),丢包%,带宽(Mbps),数据中心" }
-    { 
-      speed_mbps = int($4/125000)
-      if (speed_mbps >= '$BANDWIDTH') 
-        print $1,$2,$3"%",speed_mbps,$5
-    }
-  ' | sort -t',' -k4nr > result.csv
-  
-  # 显示优选结果
-  echo "════════════════════════════════════"
-  column -t -s',' result.csv | head -n 11
+  # 打印结果
+  printf "%-16s %-8s %-8s %-8s %-8s\n" "IP" "评分" "延迟(ms)" "丢包率(%)" "速度(Mbps)"
+  awk '{printf "%-16s %-8.2f %-8.1f %-8.0f %-8.1f\n", $2,$1,$3/3,$4*33.3,$5}' tmp/final_results.txt
 }
 
-# 代理配置
-apply_proxy() {
-  local best_ip=$(awk -F',' 'NR==2 {print $1}' result.csv)
-  local colo=$(grep $(awk -F',' 'NR==2 {print $5}' result.csv) colo.txt | cut -d' ' -f2)
-  
-  # 自动配置代理
-  sed -i "s/server_address=.*/server_address=$best_ip/" $HOME/.surfboard.conf
-  termux-notification -t "优选成功" -c "${colo}节点 | ${BANDWIDTH}Mbps带宽"
-}
+# 执行主流程
+echo "请选择运营商（回车跳过）:"
+select isp in 移动 电信 联通; do 
+  [[ $isp ]] && ISP=$isp && break
+done
 
-# 主流程
 init_env
-update_ip_pool
-smart_speedtest
-apply_proxy
+main_test
