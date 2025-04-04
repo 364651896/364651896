@@ -5,7 +5,7 @@
 THREADS=8                     # 检测线程数
 TEST_COUNT=10                 # 延迟测试次数[2](@ref)
 SPEED_TEST_SIZE=10485760      # 下载测速数据量(10MB)[5](@ref)
-DOWNLOAD_URL="https://do.wzfou.net/wzfou/CloudflareST_android_arm64.tar.gz"
+DOWNLOAD_URL="https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.2.4/CloudflareST_android_arm64.tar.gz"
 
 # 颜色定义
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; NC='\033[0m'
