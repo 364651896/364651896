@@ -13,7 +13,6 @@ MIN_SUCCESS=2             # 最低成功次数
 TIMEOUT=5                 # 超时时间(秒)
 DATA_SOURCES=(
     "https://www.cloudflare.com/ips-v4"
-    "https://www.cloudflare.com/ips-v6"
     "https://cf.iroot.eu.org/cloudflare/ips-v4"
 )
 
