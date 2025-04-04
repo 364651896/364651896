@@ -1,67 +1,80 @@
-#!/bin/bash
-# Cloudflare优选一键脚本 v4.1 (2025-04-04更新)
+#!/data/data/com.termux/files/usr/bin/bash
+# 安卓专用Cloudflare IPv4极速优选脚本 v2025.04.04
 
-CONFIG_URL="https://cdn.example.com/cf_optimizer.conf"
-DATA_URL="https://cdn.example.com/cloudflare_data.tar.gz"
+# 环境初始化
+export LD_LIBRARY_PATH=$PREFIX/lib:$LD_LIBRARY_PATH
+apt update && apt install -y curl jq openssl 2>/dev/null
 
-# 初始化配置
-init_setup() {
-    ! command -v jq &>/dev/null && apt-get install -y jq
-    ! command -v bc &>/dev/null && apt-get install -y bc
-    [ ! -d data ] && mkdir data
+# 动态参数配置
+THREADS=12                 # 并发线程数(建议8-16)
+TEST_COUNT=3               # 单IP测试次数
+MIN_SPEED=10240            # 最低速度要求(kB/s)
+TIMEOUT=2                  # 超时时间(秒)
+
+# 智能IP库管理
+IP_DATA_URL="https://cfip.speedtest.tk/ips-v4"
+LOCAL_IP_DB="$PREFIX/etc/cf_ip.db"
+
+update_ip_db() {
+    curl -sL $IP_DATA_URL -o $LOCAL_IP_DB 2>/dev/null || 
+    echo "104.16.0.0/12" > $LOCAL_IP_DB  # 内置备用IP段
+}
+
+# 网络质量检测函数
+measure_ip() {
+    local ip=$1
+    local latency=0
+    local speed=0
     
-    # 自动更新数据包
-    wget -N -q $DATA_URL -P data/ && tar -xzf data/cloudflare_data.tar.gz -C data/
-}
-
-# IPV4/IPV6优选核心
-bettercloudflareip() {
-    case $1 in
-        1|2)
-            ./CloudflareST -f data/ips-v4.txt -tl 200 -dn 20 -tll 40 $([ $1 -eq 1 ] && echo "-https")
-            ;;
-        3|4)
-            ./CloudflareST -f data/ips-v6.txt -tl 200 -dn 20 -tll 40 $([ $3 -eq 1 ] && echo "-https")
-            ;;
-    esac
-    best_ip=$(awk -F, 'NR>1 && $6>0 {print $1}' result.csv | head -1)
-    sed -i "/$DOMAIN/d" /etc/hosts
-    echo "$best_ip $DOMAIN" >> /etc/hosts
-}
-
-# 单IP测速模块
-speed_test() {
-    curl --resolve $DOMAIN:$2:$1 https://$DOMAIN/cdn-cgi/trace -o /dev/null \
-        -w "延迟: %{time_connect}s\n速度: %{speed_download} B/s\n" -s --connect-timeout 3
-}
-
-# 交互式菜单
-show_menu() {
-    clear
-    echo "=== Cloudflare优选工具 ==="
-    select opt in "IPV4优选(TLS)" "IPV4优选" "IPV6优选(TLS)" "IPV6优选" "单IP测速(TLS)" "单IP测速" "清空缓存" "更新数据" "退出"; do
-        case $REPLY in
-            1) bettercloudflareip 1 ;;
-            2) bettercloudflareip 2 ;;
-            3) bettercloudflareip 3 ;;
-            4) bettercloudflareip 4 ;;
-            5) read -p "输入测试IP: " ip; speed_test $ip 443 ;;
-            6) read -p "输入测试IP: " ip; speed_test $ip 80 ;;
-            7) rm -rf data/*.txt result.csv ;;
-            8) wget -N -q $DATA_URL -P data/ ;;
-            9) exit 0 ;;
-            *) echo -e "\033[31m错误选项，请重新选择\033[0m" ;;
-        esac
-        break
+    # TLS握手与传输速度综合检测
+    for ((i=0; i<TEST_COUNT; i++)); do
+        local result=$(curl -s --resolve speedtest.cloudflare.com:443:$ip \
+            https://speedtest.cloudflare.com/__down?bytes=50000000 \
+            -w "%{time_connect}_%{speed_download}" -o /dev/null \
+            --connect-timeout $TIMEOUT)
+        
+        [ $? -ne 0 ] && return  # 跳过不可用IP
+        
+        local connect_time=$(echo $result | cut -d'_' -f1)
+        local speed_download=$(echo $result | cut -d'_' -f2 | awk '{printf "%.0f", $1}')
+        
+        latency=$(echo "$latency + $connect_time" | bc)
+        speed=$(echo "$speed + $speed_download" | bc)
     done
+
+    # 计算平均值
+    latency=$(echo "scale=3; $latency / $TEST_COUNT" | bc)
+    speed=$(echo "scale=0; $speed / $TEST_COUNT" | bc)
+    
+    # 输出JSON格式结果
+    echo "{\"ip\":\"$ip\",\"latency\":$latency,\"speed\":$speed}"
 }
 
-# 一键执行入口
-if [ "$1" == "--install" ]; then
-    wget -N -q https://cdn.example.com/cf_optimizer.sh -O /usr/local/bin/cfopt
-    chmod +x /usr/local/bin/cfopt
-    cfopt
-else
-    init_setup
-    while true; do show_menu; done
-fi
+# 主测速流程
+main() {
+    update_ip_db
+    echo "[+] 正在生成候选IP列表..."
+    
+    # 动态IP生成算法
+    candidates=$(shuf $LOCAL_IP_DB | awk -F. '{print $1"."$2"."$3"."int(rand()*255)}' | head -n 500)
+    
+    # 并行检测
+    echo "[+] 启动多线程检测..."
+    for ip in $candidates; do
+        ((i=i%THREADS)); ((i++==0)) && wait
+        measure_ip $ip >> results.tmp &
+    done
+    wait
+
+    # 结果分析
+    echo "[+] 分析检测结果..."
+    jq -c 'select(.speed > '$MIN_SPEED')' results.tmp | \
+    jq -s 'sort_by(.latency, -.speed)' | \
+    jq -r '.[] | "\(.ip) 延迟:\(.latency*1000|round)ms 速度:\(.speed/1024|round)MB/s"'
+    
+    # 清理临时文件
+    rm -f results.tmp
+}
+
+# 执行入口
+main
