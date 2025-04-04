@@ -13,16 +13,28 @@ dynamic_timeout() {
 # [优化] 核心IP段预筛选
 CF_IP_PREFER_RANGES=("104.16" "104.24" "172.64" "108.162")
 
-function bettercloudflareip(){
-    # [新增] 缓存检查
+fifunction bettercloudflareip(){
+    # [修正] 缓存检查逻辑
     if [ -f "cf_bestip.cache" ]; then
         cached_ip=$(awk '{print $1}' cf_bestip.cache)
-        if curl --resolve $domain:443:$cached_ip -m 2 -Is https://$domain | grep -q "200"; then
+        # 增加-n判断防止空值
+        if [ -n "$cached_ip" ] && curl --resolve $domain:443:"$cached_ip" -m 2 -Is https://$domain | grep -q "200"; then
             echo "使用缓存IP: $cached_ip"
             anycast=$cached_ip
             return
         fi
     fi
+
+    # [修正] 结果验证部分
+    if [ "$(echo "${temp[@]}" | sed -e 's/ /\n/g' | grep -c 'colo=')" -eq 0 ]; then
+        publicip="获取超时"
+        colo="获取超时"
+    else
+        publicip=$(echo "${temp[@]}" | sed -e 's/ /\n/g' | awk -F= '/ip=/ {print $2}')
+        colo_code=$(echo "${temp[@]}" | sed -e 's/ /\n/g' | awk -F= '/colo=/ {print $2}')
+        colo=$(grep -w "$colo_code" colo.txt | awk -F'-' '{print $1}')
+    fi
+
 
     read -p "请设置期望的带宽大小(默认最小1,单位 Mbps):" bandwidth
     read -p "请设置RTT测试进程数(默认10,最大50):" tasknum
