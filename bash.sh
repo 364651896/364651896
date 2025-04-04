@@ -1,64 +1,74 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# 安卓专用Cloudflare IPv4极速优选脚本 (2025.04.04)
+# Android Cloudflare IP优选引擎 v2.5 (2025.04.04)
 
-# 环境变量
-export LD_LIBRARY_PATH=$PREFIX/lib:$LD_LIBRARY_PATH
-THREADS=10                  # 并发线程数（建议8-12）
-TEST_COUNT=3                # 单IP测试次数
-TIMEOUT=2                   # 超时时间（秒）
-API_URL="https://api.vvhan.com/tool/cf_ip"  # 预筛选IP源[1,6](@ref)
+# 配置参数
+THREADS=12                   # 动态线程池容量
+TIMEOUT=3                    # 单次检测超时(秒)
+TEST_COUNT=3                 # 单IP重复测试次数
+API_URL="https://cf.vi/ipv4" # 候选IP源API
+SPEED_TEST_SIZE=5242880      # 测速数据量(5MB)
 
-# 获取预筛选IP列表（减少本地生成开销）
-fetch_ips() {
-    curl -sL $API_URL | jq -r '.data.v4.CT[].ip' > ips.txt
-    shuf ips.txt | head -n 200  # 随机取200个IP测试
+# 颜色定义
+RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; NC='\033[0m'
+
+# 多维检测函数
+multi_detect() {
+    local ip=$1
+    local total_score=0
+    
+    # 维度1: TLS握手延迟
+    local tls_delay=$(curl -x socks5://$ip:443 --resolve speed.cloudflare.com:443:$ip \
+        -o /dev/null -s -w "%{time_appconnect}" \
+        --connect-timeout $TIMEOUT https://speed.cloudflare.com/__down?bytes=1024)
+    
+    # 维度2: 下载速度
+    local speed_result=$(curl -x socks5://$ip:443 --resolve speed.cloudflare.com:443:$ip \
+        -o /dev/null -s -w "%{speed_download}_%{time_total}" \
+        --connect-timeout $TIMEOUT https://speed.cloudflare.com/__down?bytes=$SPEED_TEST_SIZE)
+    
+    # 维度3: TCP端口可用性
+    nc -zv -w $TIMEOUT $ip 443 &>/dev/null && tcp_score=1 || tcp_score=0
+    
+    # 计算综合得分
+    local speed=$(awk -F_ '{printf "%.0f", $1/1024}' <<< $speed_result)
+    local total_time=$(awk -F_ '{print $2}' <<< $speed_result)
+    total_score=$(bc <<< "scale=2; ($tcp_score*0.3 + (1/$tls_delay)*0.4 + $speed/100*0.3)*100")
+    
+    echo "{\"ip\":\"$ip\",\"score\":$total_score,\"speed\":$speed,\"delay\":${tls_delay}000}"
 }
 
-# 综合测速（延迟+带宽）
-measure_ip() {
-    local ip=$1
-    local total_latency=0
-    local max_speed=0
-    
-    for ((i=1; i<=$TEST_COUNT; i++)); do
-        # TLS延迟检测
-        result=$(curl --resolve speedtest.cloudflare.com:443:$ip \
-            -o /dev/null -s -w "%{time_connect}_%{speed_download}" \
-            --connect-timeout $TIMEOUT https://speedtest.cloudflare.com/__down?bytes=50000000)
-        
-        [ $? -ne 0 ] && return  # 跳过无效IP
-        
-        # 数据解析
-        latency=$(echo $result | cut -d'_' -f1 | bc -l <<< "scale=3; $(cat) * 1000")
-        speed=$(echo $result | cut -d'_' -f2 | awk '{printf "%.0f", $1/1024}')
-        
-        total_latency=$(echo "$total_latency + $latency" | bc)
-        [ $speed -gt $max_speed ] && max_speed=$speed
-    done
-
-    # 计算平均延迟
-    avg_latency=$(echo "scale=0; $total_latency / $TEST_COUNT" | bc)
-    echo "{\"ip\":\"$ip\",\"latency\":$avg_latency,\"speed\":$max_speed}"
+# 进度可视化
+progress_bar() {
+    local current=$1 total=$2
+    local width=30
+    local percent=$((current*100/total))
+    local fill=$((width*percent/100))
+    printf "\r[${GREEN}%-${width}s${NC}] %d%%" "$(printf '#%.0s' $(seq 1 $fill))" "$percent"
 }
 
 # 主流程
 main() {
-    echo "[+] 生成候选IP列表..."
-    ips=$(fetch_ips)
+    echo -e "${YELLOW}[+] 获取候选IP列表...${NC}"
+    ips=($(curl -sL $API_URL | jq -r '.data.v4.CT[].ip'))
+    total=${#ips[@]}
     
-    echo "[+] 启动多线程检测（$THREADS线程）..."
-    for ip in $ips; do
-        ((i=i%THREADS)); ((i++==0)) && wait
-        measure_ip $ip >> results.tmp &
+    echo -e "${YELLOW}[+] 启动${THREADS}线程检测...${NC}"
+    rm -f results.tmp
+    for ((i=0; i<total; i++)); do
+        ((i%THREADS==0)) && wait
+        progress_bar $i $total
+        multi_detect ${ips[$i]} >> results.tmp &
     done
     wait
-
-    echo "[+] 分析检测结果..."
-    jq -c 'select(.speed > 0)' results.tmp | \
-    jq -s 'sort_by(.latency, -.speed)' | \
-    jq -r '.[] | "\(.ip) 延迟:\(.latency|round)ms 速度:\(.speed)MB/s"'
     
-    rm -f results.tmp ips.txt
+    echo -e "\n${YELLOW}[+] 生成优选报告...${NC}"
+    sort_result=$(jq -s 'sort_by(-.score)' results.tmp | jq -r '.[0:10]')
+    
+    echo -e "\n${GREEN}=== 优选TOP10 IP ==="
+    jq -r '.[] | "\(.ip)\t延迟:\(.delay|tonumber)ms\t速度:\(.speed)MB/s\t综合分:\(.score|floor)"' <<< "$sort_result"
+    echo -e "====================${NC}"
+    
+    rm -f results.tmp
 }
 
 main
