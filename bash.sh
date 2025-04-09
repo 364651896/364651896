@@ -68,7 +68,10 @@ do
 	do
 		if [ $n -le 3 ]
 		then
-			rsp=$(curl --resolve $domain:443:$ip https://$domain/cdn-cgi/trace -o /dev/null -s --connect-timeout 2 --max-time 5 -w %{time_connect}_%{http_code})
+			curl_command="curl --resolve $domain:443:$ip https://$domain/cdn-cgi/trace -o /dev/null -s --connect-timeout 2 --max-time 5 -w %{time_connect}_%{http_code}"
+			echo "正在执行 RTT 测试命令: $curl_command"
+			rsp=$(eval "$curl_command")
+			echo "RTT 测试命令结果: $rsp"
 			if [ $(echo $rsp | awk -F_ '{print $2}') != 200 ]
 			then
 				avgms=0
@@ -94,7 +97,7 @@ do
 			break
 		fi
 	done
-	sleep 0.1 # Add a small delay between testing each IP in the batch
+	sleep 0.1
 done
 rm -rf rtt/$1.txt
 }
