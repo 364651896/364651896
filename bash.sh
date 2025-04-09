@@ -68,7 +68,7 @@ do
 	do
 		if [ $n -le 3 ]
 		then
-			rsp=$(curl --resolve $domain:443:$ip https://$domain/cdn-cgi/trace -o /dev/null -s --connect-timeout 1 --max-time 3 -w %{time_connect}_%{http_code})
+			rsp=$(curl --resolve $domain:443:$ip https://$domain/cdn-cgi/trace -o /dev/null -s --connect-timeout 2 --max-time 5 -w %{time_connect}_%{http_code})
 			if [ $(echo $rsp | awk -F_ '{print $2}') != 200 ]
 			then
 				avgms=0
@@ -94,6 +94,7 @@ do
 			break
 		fi
 	done
+	sleep 0.1 # Add a small delay between testing each IP in the batch
 done
 rm -rf rtt/$1.txt
 }
